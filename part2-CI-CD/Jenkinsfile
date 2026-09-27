@@ -1,0 +1,134 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION       = 'us-east-1'
+        ARTIFACT_BUCKET  = 'example-app-artifacts'
+        ASG_NAME         = 'internal-app-asg'
+        TARGET_GROUP_ARN = 'arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/app-tg/abc123'
+        APP_URL          = 'https://app.example.com'
+    }
+
+    triggers {
+        githubPush()   // fires on merge to main via GitHub webhook
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script { env.GIT_SHA = sh(script: 'git rev-parse HEAD', returnStdout: true).trim() }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                sh '''
+                    python3 -m venv venv
+                    ./venv/bin/pip install -r requirements.txt pytest pytest-django pip-audit
+                    ./venv/bin/pip-audit -r requirements.txt
+                    ./venv/bin/python manage.py makemigrations --check --dry-run
+                    ./venv/bin/pytest -q
+                '''
+            }
+        }
+
+        stage('Build artifact') {
+            steps {
+                sh "git archive --format=tar.gz -o app-${GIT_SHA}.tar.gz HEAD"
+            }
+        }
+
+        stage('Upload to S3') {
+            steps {
+                sh "aws s3 cp app-${GIT_SHA}.tar.gz s3://${ARTIFACT_BUCKET}/releases/${GIT_SHA}.tar.gz"
+            }
+        }
+
+        stage('Discover instances') {
+            steps {
+                script {
+                    env.INSTANCE_IDS = sh(
+                        script: """
+                            aws autoscaling describe-auto-scaling-groups \
+                              --auto-scaling-group-names ${ASG_NAME} \
+                              --query 'AutoScalingGroups[0].Instances[?LifecycleState==\`InService\`].InstanceId' \
+                              --output text
+                        """,
+                        returnStdout: true
+                    ).trim().replaceAll('\\s+', ',')
+                    if (!env.INSTANCE_IDS) { error("No InService instances found in ${ASG_NAME}") }
+                    echo "Deploying to: ${env.INSTANCE_IDS}"
+                }
+            }
+        }
+
+        stage('Deploy (rolling, one instance at a time)') {
+            steps {
+                script {
+                    def instances = env.INSTANCE_IDS.split(',')
+                    for (id in instances) {
+                        echo "Deploying to ${id}"
+                        sh """
+                            CMD_ID=\$(aws ssm send-command \
+                              --instance-ids ${id} \
+                              --document-name AWS-RunShellScript \
+                              --comment "deploy ${GIT_SHA}" \
+                              --parameters 'commands=["/opt/app/bin/deploy.sh s3://${ARTIFACT_BUCKET}/releases/${GIT_SHA}.tar.gz"]' \
+                              --query 'Command.CommandId' --output text)
+                            aws ssm wait command-executed --command-id \$CMD_ID --instance-id ${id}
+                            aws ssm get-command-invocation --command-id \$CMD_ID --instance-id ${id} \
+                              --query '[Status,StandardOutputContent,StandardErrorContent]' --output text
+                        """
+                        // Confirm this instance is healthy in the target group before moving to the next
+                        sh """
+                            for i in \$(seq 1 15); do
+                              STATE=\$(aws elbv2 describe-target-health \
+                                --target-group-arn ${TARGET_GROUP_ARN} \
+                                --targets Id=${id} \
+                                --query 'TargetHealthDescriptions[0].TargetHealth.State' --output text)
+                              [ "\$STATE" = "healthy" ] && exit 0
+                              sleep 5
+                            done
+                            echo "Instance ${id} never became healthy"; exit 1
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Public health check') {
+            steps {
+                sh """
+                    for i in \$(seq 1 10); do
+                      curl -fsS ${APP_URL}/readyz && exit 0
+                      sleep 5
+                    done
+                    exit 1
+                """
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo "Deployment failed — rolling back all targeted instances"
+            script {
+                def instances = env.INSTANCE_IDS ? env.INSTANCE_IDS.split(',') : []
+                for (id in instances) {
+                    sh """
+                        aws ssm send-command \
+                          --instance-ids ${id} \
+                          --document-name AWS-RunShellScript \
+                          --parameters 'commands=["/opt/app/bin/rollback.sh"]' \
+                          --query 'Command.CommandId' --output text
+                    """
+                }
+            }
+        }
+        always {
+            sh "rm -f app-${GIT_SHA}.tar.gz || true"
+        }
+    }
+}
